@@ -9,7 +9,8 @@ from pulp.server.db.connection import initialize as db_initialize
 
 
 class AttributeFactory(object):
-    def __init__(self, attr_name, set_none=False, do_str=True):
+    def __init__(self, attr_name, set_none=False, conversion=lambda x: str(x),
+                 target_attr=None, default=None):
         """Declare a simple attribute.
 
         Usage:
@@ -29,20 +30,26 @@ class AttributeFactory(object):
 
         To use on generic objects rather than on solvables, setting
         the attributes can be adjusted by the
-        set_none=False and do_str=True keywords.
+        set_none=False and conversion keywords.
 
         :param attr_name: attribute name to be set on the target object
         :type attr_name: basestring
         :param set_none: a flag to control setting None as attribute value
         :type set_none: True/False
-        :param do_str: a flag whether to apply str() to a value before setting
-                       the attribute
-        :type do_str: True/False
+        :param conversion: a function converting the value from the unit space
+                           to the solvable space
+        :type conversion: callable(value) -> value or None
+        :param target_attr: the target attribute to use
+        :type target_attr: basestring or None
+        :param default: default value to use.
+        :type default: object or None
         """
 
         self.attr_name = attr_name
         self.set_none = set_none
-        self.do_str = do_str
+        self.conversion = conversion
+        self.target_attr = target_attr
+        self.default = default
 
     def __call__(self, solvable, unit, parent_factory=None):
         """Set the solvable.<attr_name> with the unit.<attr_name> value.
@@ -52,7 +59,7 @@ class AttributeFactory(object):
 
 
         :param solvable: a solv solvable object
-        :type source: a solv solvable object
+        :type solvable: a solv solvable object
         :param unit: a content unit or a dictionary to get the <attr_name>
                      value from
         :type unit: an object or a dictionary
@@ -60,15 +67,17 @@ class AttributeFactory(object):
         :returns: None
         """
         if isinstance(unit, dict):
-            value = unit.get(self.attr_name)
+            value = unit.get(self.attr_name, self.default)
         else:
-            value = getattr(unit, self.attr_name)
-        print('processing unit {} attribute {} value {}'.format(
-            unit, self.attr_name, value))
+            value = getattr(unit, self.attr_name, self.default)
+        if self.conversion:
+            value = self.conversion(value)
+        print('processing unit {} attribute {} value {} {}'.format(
+            unit, self.attr_name, value,
+            'as: {}'.format(self.target_attr) if self.target_attr else ''))
         if value is None and not self.set_none:
             return
-        # all solvable attributes have to be basestrings
-        setattr(solvable, self.attr_name, self.do_str and str(value) or value)
+        setattr(solvable, self.target_attr or self.attr_name, value)
 
 
 class EVRAttributeFactory(object):
@@ -78,9 +87,9 @@ class EVRAttributeFactory(object):
     """
     attribute_factory = AttributeFactory('evr')
     attribute_factories = [
-        AttributeFactory('epoch', set_none=True),
-        AttributeFactory('version', set_none=True),
-        AttributeFactory('release', set_none=True),
+        AttributeFactory('epoch', conversion=None, set_none=True),
+        AttributeFactory('version', conversion=None, set_none=True),
+        AttributeFactory('release', conversion=None, set_none=True),
     ]
 
     @staticmethod
@@ -133,13 +142,13 @@ class RpmDependencyAttributeFactory(object):
     attribute_factories = [
         AttributeFactory('name', set_none=True),
         EVRAttributeFactory(),
-        AttributeFactory('flags', set_none=True, do_str=False),
+        AttributeFactory('flags', set_none=True, conversion=None),
     ]
 
     class Adaptor(object):
         pass
 
-    def __init__(self, attr_name):
+    def __init__(self, attr_name, dependency_key=None):
         """An RPM-specific dependency factory.
 
         for the provides, requires, etc... dependency attributes
@@ -148,8 +157,11 @@ class RpmDependencyAttributeFactory(object):
 
         :param attr_name: the attribute name to use
         :type attr_name: basestring
+        :param dependency_key: the key to use e.g solv.SOLVABLE_REQUIRES
+        :type dependency_key: solv.SOLVABLE_REQUIRES/_PROVIDES... or None
         """
         self.attr_name = attr_name
+        self.dependency_key = dependency_key
 
     def __call__(self, solvable, unit, solv_factory):
         """Set the solvable dependencies.
@@ -203,7 +215,8 @@ class RpmDependencyAttributeFactory(object):
         :returns: None
         """
         # e.g SOLVABLE_PROVIDES, SOLVABLE_REQUIRES...
-        keyname = getattr(solv, 'SOLVABLE_{}'.format(self.attr_name.upper()))
+        keyname = self.dependency_key or getattr(
+            solv, 'SOLVABLE_{}'.format(self.attr_name.upper()))
         # process all the records in e.g unit.requires which is a list of
         # dictionaries describing the unit dependencies
         dependency_unit_infos = getattr(unit, self.attr_name, [])
@@ -286,11 +299,47 @@ class RpmUnitSolvableFactory(BasetUnitSolvableFactory):
     ]
 
 
-def load_repo_units(plugin_manager, repo_name, factory):
+class ErratumSolvableFactory(BasetUnitSolvableFactory):
+    attribute_factories = [
+        # cargo-culting from
+        # https://github.com/openSUSE/libsolv/blob/master/ext/repo_updateinfoxml.c
+        AttributeFactory('errata_id', target_attr='name',
+                         conversion=lambda x: 'errata:{}'.format(x)),
+        AttributeFactory('arch', default='noarch'),
+        AttributeFactory('errata_from', target_attr='vendor'),
+        EVRAttributeFactory(),
+        # FIXME: not all these units are really required; what pulp does is it
+        # filters rpm_search_dicts to nevras actually present in the source repo:
+        #   https://github.com/pulp/pulp_rpm/blob/ef5fc5b2af47736114b68bc08658d9b2a94b84e1/plugins/pulp_rpm/plugins/importers/yum/associate.py#L91,#L94
+        # Could this be handled as some ignore_missing?
+        RpmDependencyAttributeFactory(
+            'rpm_search_dicts', dependency_key=solv.SOLVABLE_REQUIRES),
+    ]
+
+    def __call__(self, unit):
+        # RPMs "self-provide"; errata don't --- have to be explicit; see also:
+        # https://github.com/openSUSE/libsolv/blob/master/ext/repo_updateinfoxml.c#L343
+        solvable = super(ErratumSolvableFactory, self).__call__(unit)
+        pool = self.solv_repo.pool
+        dep = pool.Dep(solvable.name)
+        dep = dep.Rel(solv.REL_EQ, pool.Dep(solvable.evr))
+        solvable.add_deparray(solv.SOLVABLE_PROVIDES, dep)
+        return solvable
+
+
+MODEL_SOLVABLE_FACTORY_MAPPING = {
+    'rpm': RpmUnitSolvableFactory,
+    'erratum': ErratumSolvableFactory,
+}
+
+
+def load_repo_units(plugin_manager, repo_name, factory_mapping):
     for rcu in RepositoryContentUnit.objects.find_by_criteria(
             Criteria(filters={'repo_id': repo_name})):
         # just the RPMs for now O:-)
-        if rcu.unit_type_id != 'rpm':
+        try:
+            factory = factory_mapping[rcu.unit_type_id]
+        except KeyError:
             print('skipping {}'.format(rcu.unit_type_id))
             continue
         model = plugin_manager.unit_models[rcu.unit_type_id]
@@ -306,27 +355,40 @@ if __name__ == '__main__':
     argparser.add_argument('--unit', default='penguin')
     argparser.add_argument('--target-repo', default='zoo')
     argparser.add_argument('--ignore-recommends', action='store_true')
+    argparser.add_argument('--debuglevel', choices=[0, 1, 2, 3], type=int,
+                           default=0)
     args = argparser.parse_args()
 
     pm = manager.PluginManager()
     db_initialize()
 
     pool = solv.Pool()
+    pool.set_debuglevel(args.debuglevel)
     pool.setarch()
     # pretend nothing has been installed so far
     target_repo = pool.add_repo('@System')
-    t_rufus = RpmUnitSolvableFactory(target_repo)
-    load_repo_units(pm, args.target_repo, t_rufus)
+    target_unit_solvable_factory_mapping = {
+        'rpm': RpmUnitSolvableFactory(target_repo),
+        'erratum': ErratumSolvableFactory(target_repo),
+    }
+    load_repo_units(pm, args.target_repo, target_unit_solvable_factory_mapping)
     pool.installed = target_repo
 
     # load the Pulp repo provided on the CLI
-    solv_repo = pool.add_repo(args.source_repo)
-    s_rufus = RpmUnitSolvableFactory(solv_repo)
-    load_repo_units(pm, args.source_repo, s_rufus)
+    source_repo = pool.add_repo(args.source_repo)
+    source_unit_solvable_factory_mapping = {
+        'rpm': RpmUnitSolvableFactory(source_repo),
+        'erratum': ErratumSolvableFactory(source_repo),
+    }
+    load_repo_units(pm, args.source_repo, source_unit_solvable_factory_mapping)
 
+    print('---')
+    print('Loaded solvables:')
     for solvable in pool.solvables:
         print("{}".format(solvable))
 
+    print('---')
+    print('solving...')
     # ###
     # Cargo-culting https://github.com/openSUSE/libsolv/blob/master/examples/pysolv
     #
@@ -337,8 +399,16 @@ if __name__ == '__main__':
     # If this was a recursive copy task, the target repo would have been used
     # as libsolv system repo to prevent copying dependencies already satisfied
     # in the target repo.
+
+    # for debugging purposes, always create, even if not in Pulp repo.
+    solv_id = pool.str2id(args.unit, create=True)
+    print('unit {} solv id: {}'.format(args.unit, solv_id))
+    print('solv id {} unit: {}'.format(solv_id, pool.id2str(solv_id)))
+
     job = pool.Job(solv.Job.SOLVER_SOLVABLE_NAME |
-                   solv.Job.SOLVER_INSTALL, pool.str2id(args.unit))
+                   solv.Job.SOLVER_INSTALL, solv_id)
+
+    print('job: {}'.format(job))
 
     solver = pool.Solver()
     solver.set_flag(solv.Solver.SOLVER_FLAG_IGNORE_RECOMMENDED, args.ignore_recommends)
@@ -359,7 +429,8 @@ if __name__ == '__main__':
         args.unit, args.source_repo, args.target_repo))
     for s in transaction.newsolvables():
         print('solvable - {} as unit: {}'.format(
-            s, s_rufus.get_unit(s.id)))
+            s, (source_unit_solvable_factory_mapping['rpm'].get_unit(s.id) or
+                source_unit_solvable_factory_mapping['erratum'].get_unit(s.id))))
 
 
     print('\nTransaction details:')
@@ -377,4 +448,8 @@ if __name__ == '__main__':
             else:
                 print("  - %s" % p)
 
+    print ('---')
+    print('Alternatives:')
+    for alternative in solver.all_alternatives():
+        print("{}".format(alternative))
     print('Done.')
