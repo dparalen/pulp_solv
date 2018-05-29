@@ -182,7 +182,7 @@ class RpmDependencyAttributeFactory(object):
 
         The relationship to the solvable is tracked by a Rel pool object:
 
-            relationship = pool.Rel(solv.REL_AND, dependency(evr))
+            relationship = pool.Rel(solv.REL_AND, pool.Dep(evr))
 
         where the evr is the 'epoch:version-release' string. The relationship
         is then recorded on the solvable explicitly by:
@@ -217,7 +217,6 @@ class RpmDependencyAttributeFactory(object):
             if adaptor.name.startswith('('):
                 # the Rich/Boolean dependencies have just the 'name' attribute
                 # this is always in the form: '(foo >= 1.2 AND bar != 0.9)'
-                # FIXME this needs libsolv compile-time flags to be exposed
                 dep = pool.parserpmrichdep(adaptor.name)
             else:
                 # generic dependencies provide at least a solvable name
@@ -277,7 +276,9 @@ class RpmUnitSolvableFactory(BasetUnitSolvableFactory):
         AttributeFactory('arch'),
         AttributeFactory('vendor'),
         RpmDependencyAttributeFactory('requires'),
+        RpmDependencyAttributeFactory('conflicts'),
         RpmDependencyAttributeFactory('provides'),
+        RpmDependencyAttributeFactory('obsoletes'),
     ]
 
 
