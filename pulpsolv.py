@@ -206,7 +206,7 @@ class RpmDependencyAttributeFactory(object):
         keyname = getattr(solv, 'SOLVABLE_{}'.format(self.attr_name.upper()))
         # process all the records in e.g unit.requires which is a list of
         # dictionaries describing the unit dependencies
-        dependency_unit_infos = getattr(unit, self.attr_name)
+        dependency_unit_infos = getattr(unit, self.attr_name, [])
         print('processing unit {} attribute {} value {}'.format(
             unit, self.attr_name, dependency_unit_infos))
         pool = solv_factory.solv_repo.pool
