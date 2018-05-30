@@ -279,6 +279,10 @@ class RpmUnitSolvableFactory(BasetUnitSolvableFactory):
         RpmDependencyAttributeFactory('conflicts'),
         RpmDependencyAttributeFactory('provides'),
         RpmDependencyAttributeFactory('obsoletes'),
+        RpmDependencyAttributeFactory('recommends'),
+        RpmDependencyAttributeFactory('suggests'),
+        RpmDependencyAttributeFactory('supplements'),
+        RpmDependencyAttributeFactory('enhances'),
     ]
 
 
@@ -301,6 +305,7 @@ if __name__ == '__main__':
     argparser.add_argument('--source-repo', default='zoo')
     argparser.add_argument('--unit', default='penguin')
     argparser.add_argument('--target-repo', default='zoo')
+    argparser.add_argument('--ignore-recommends', action='store_true')
     args = argparser.parse_args()
 
     pm = manager.PluginManager()
@@ -336,6 +341,8 @@ if __name__ == '__main__':
                    solv.Job.SOLVER_INSTALL, pool.str2id(args.unit))
 
     solver = pool.Solver()
+    solver.set_flag(solv.Solver.SOLVER_FLAG_IGNORE_RECOMMENDED, args.ignore_recommends)
+
     problems = solver.solve([job])
 
     for problem in problems:
