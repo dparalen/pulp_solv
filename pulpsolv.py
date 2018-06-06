@@ -327,16 +327,36 @@ class ErratumSolvableFactory(BasetUnitSolvableFactory):
         return solvable
 
 
+class SrpmSolvableFactory(BasetUnitSolvableFactory):
+    # An SRPM content unit factory
+    attribute_factories = [
+        AttributeFactory('name'),
+        EVRAttributeFactory(),
+        AttributeFactory('arch'),
+        AttributeFactory('vendor'),
+        RpmDependencyAttributeFactory('requires'),
+        RpmDependencyAttributeFactory('conflicts'),
+    ]
+
+    def __call__(self, unit):
+        solvable = super(SrpmSolvableFactory, self).__call__(unit)
+        pool = self.solv_repo.pool
+        dep = pool.Dep(solvable.name)
+        dep = dep.Rel(solv.REL_EQ, pool.Dep(solvable.evr))
+        solvable.add_deparray(solv.SOLVABLE_PROVIDES, dep)
+        return solvable
+
+
 MODEL_SOLVABLE_FACTORY_MAPPING = {
     'rpm': RpmUnitSolvableFactory,
     'erratum': ErratumSolvableFactory,
+    'srpm': SrpmSolvableFactory,
 }
 
 
 def load_repo_units(plugin_manager, repo_name, factory_mapping):
     for rcu in RepositoryContentUnit.objects.find_by_criteria(
             Criteria(filters={'repo_id': repo_name})):
-        # just the RPMs for now O:-)
         try:
             factory = factory_mapping[rcu.unit_type_id]
         except KeyError:
@@ -346,6 +366,13 @@ def load_repo_units(plugin_manager, repo_name, factory_mapping):
         unit = model.objects.get(pk=rcu.unit_id)
         print('loaded {}'.format(unit))
         factory(unit)
+
+
+def repo_unit_type_factory_mapping(repo):
+    return {
+        unit_type: unit_type_factory(repo)
+        for unit_type, unit_type_factory in MODEL_SOLVABLE_FACTORY_MAPPING.items()
+    }
 
 
 if __name__ == '__main__':
@@ -367,19 +394,14 @@ if __name__ == '__main__':
     pool.setarch()
     # pretend nothing has been installed so far
     target_repo = pool.add_repo('@System')
-    target_unit_solvable_factory_mapping = {
-        'rpm': RpmUnitSolvableFactory(target_repo),
-        'erratum': ErratumSolvableFactory(target_repo),
-    }
+
+    target_unit_solvable_factory_mapping = repo_unit_type_factory_mapping(target_repo)
     load_repo_units(pm, args.target_repo, target_unit_solvable_factory_mapping)
     pool.installed = target_repo
 
     # load the Pulp repo provided on the CLI
     source_repo = pool.add_repo(args.source_repo)
-    source_unit_solvable_factory_mapping = {
-        'rpm': RpmUnitSolvableFactory(source_repo),
-        'erratum': ErratumSolvableFactory(source_repo),
-    }
+    source_unit_solvable_factory_mapping = repo_unit_type_factory_mapping(source_repo)
     load_repo_units(pm, args.source_repo, source_unit_solvable_factory_mapping)
 
     print('---')
@@ -400,20 +422,27 @@ if __name__ == '__main__':
     # as libsolv system repo to prevent copying dependencies already satisfied
     # in the target repo.
 
-    # for debugging purposes, always create, even if not in Pulp repo.
-    solv_id = pool.str2id(args.unit, create=True)
-    print('unit {} solv id: {}'.format(args.unit, solv_id))
-    print('solv id {} unit: {}'.format(solv_id, pool.id2str(solv_id)))
+    flags = (
+        solv.Selection.SELECTION_NAME |
+        solv.Selection.SELECTION_PROVIDES |
+        solv.Selection.SELECTION_GLOB |
+        solv.Selection.SELECTION_DOTARCH |
+        solv.Selection.SELECTION_WITH_SOURCE
+    )
 
-    job = pool.Job(solv.Job.SOLVER_SOLVABLE_NAME |
-                   solv.Job.SOLVER_INSTALL, solv_id)
+    selection = pool.select(args.unit, flags)
+    if selection.isempty():
+        print("{} not found".format(args.unit))
+        sys.exit(1)
 
-    print('job: {}'.format(job))
+    jobs = selection.jobs(solv.Job.SOLVER_INSTALL)
+
+    print('job: {}'.format(jobs))
 
     solver = pool.Solver()
     solver.set_flag(solv.Solver.SOLVER_FLAG_IGNORE_RECOMMENDED, args.ignore_recommends)
 
-    problems = solver.solve([job])
+    problems = solver.solve(jobs)
 
     for problem in problems:
         # problems were encountered resolving the unit dependencies
@@ -430,7 +459,8 @@ if __name__ == '__main__':
     for s in transaction.newsolvables():
         print('solvable - {} as unit: {}'.format(
             s, (source_unit_solvable_factory_mapping['rpm'].get_unit(s.id) or
-                source_unit_solvable_factory_mapping['erratum'].get_unit(s.id))))
+                source_unit_solvable_factory_mapping['erratum'].get_unit(s.id) or
+                source_unit_solvable_factory_mapping['srpm'].get_unit(s.id))))
 
 
     print('\nTransaction details:')
