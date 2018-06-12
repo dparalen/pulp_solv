@@ -1,4 +1,6 @@
 import argparse
+import collections
+import functools
 import solv
 import sys
 
@@ -8,162 +10,148 @@ from pulp.server.db.model.criteria import Criteria
 from pulp.server.db.connection import initialize as db_initialize
 
 
-class AttributeFactory(object):
-    def __init__(self, attr_name, set_none=False, conversion=lambda x: str(x),
-                 target_attr=None, default=None):
-        """Declare a simple attribute.
+def attribute_factory(attr_name, set_none=False, conversion=lambda x: str(x),
+                      target_attr=None, default=None):
+    """Declare a simple attribute.
 
-        Usage:
+    Usage:
 
-        pool = solv.Pool()
-        repo = solv.add_repo('Foo')
-        solvable = repo.add_solvable()
-        name_attribute = AttributeFactory('name')
-        name_attribute(foo, lion_rpm)
+    pool = solv.Pool()
+    repo = solv.add_repo('Foo')
+    solvable = repo.add_solvable()
+    name_attribute = attribute_factory('name')
+    name_attribute(foo, lion_rpm)
 
-        assert foo.name == lion_rpm.name
+    assert foo.name == lion_rpm.name
 
-        This is primarily intended to construct a solv solvable from a content
-        unit which requires:
-        * no attribute set instead an attribute value of None
-        * any attribute has to be put thru str()
+    This is primarily intended to construct a solv solvable from a content
+    unit which requires:
+    * no attribute set instead an attribute value of None
+    * any attribute has to be put thru str()
 
-        To use on generic objects rather than on solvables, setting
-        the attributes can be adjusted by the
-        set_none=False and conversion keywords.
+    To use on generic objects rather than on solvables, setting
+    the attributes can be adjusted by the
+    set_none=False and conversion keywords.
 
-        :param attr_name: attribute name to be set on the target object
-        :type attr_name: basestring
-        :param set_none: a flag to control setting None as attribute value
-        :type set_none: True/False
-        :param conversion: a function converting the value from the unit space
-                           to the solvable space
-        :type conversion: callable(value) -> value or None
-        :param target_attr: the target attribute to use
-        :type target_attr: basestring or None
-        :param default: default value to use.
-        :type default: object or None
-        """
+    :param attr_name: attribute name to be set on the target object
+    :type attr_name: basestring
+    :param set_none: a flag to control setting None as attribute value
+    :type set_none: True/False
+    :param conversion: a function converting the value from the unit space
+                        to the solvable space
+    :type conversion: callable(value) -> value or None
+    :param target_attr: the target attribute to use
+    :type target_attr: basestring or None
+    :param default: default value to use.
+    :type default: object or None
+    """
 
-        self.attr_name = attr_name
-        self.set_none = set_none
-        self.conversion = conversion
-        self.target_attr = target_attr
-        self.default = default
-
-    def __call__(self, solvable, unit, parent_factory=None):
+    def inner_factory(solvable, unit, repo=None):
         """Set the solvable.<attr_name> with the unit.<attr_name> value.
-
-        It might be required later on to be able to use a different target
-        attribute name; maybe with a target_attr_name=None keyword.
-
 
         :param solvable: a solv solvable object
         :type solvable: a solv solvable object
         :param unit: a content unit or a dictionary to get the <attr_name>
                      value from
         :type unit: an object or a dictionary
-        :param parent_factory: ignored
+        :param repo: the repo being populated; ignored
+        :type repo: solv.Repo
         :returns: None
         """
         if isinstance(unit, dict):
-            value = unit.get(self.attr_name, self.default)
+            value = unit.get(attr_name, default)
         else:
-            value = getattr(unit, self.attr_name, self.default)
-        if self.conversion:
-            value = self.conversion(value)
+            value = getattr(unit, attr_name, default)
+        if conversion:
+            value = conversion(value)
         print('processing unit {} attribute {} value {} {}'.format(
-            unit, self.attr_name, value,
-            'as: {}'.format(self.target_attr) if self.target_attr else ''))
-        if value is None and not self.set_none:
+            unit, attr_name, value,
+            'as: {}'.format(target_attr) if target_attr else ''))
+        if value is None and not set_none:
             return
-        setattr(solvable, self.target_attr or self.attr_name, value)
+        setattr(solvable, target_attr or attr_name, value)
+    return inner_factory
 
 
-class EVRAttributeFactory(object):
-    """A specific, epoch, version and release compound attribute.
+def format_evr(version, epoch=None, release=None):
+    """The EVR value has a specific way of representation in solv.
 
-    Would be provided by pulp_rpm unless e.g the Deb plug-in requires this
+    :param version: the version value
+    :type version: basestring
+    :param epoch: the epoch value; optional
+    :type epoch: basestring or None
+    :param release: the release value; optional
+    :type release: basestring or None
+    :returns: the epoch:version-release string
     """
-    attribute_factory = AttributeFactory('evr')
-    attribute_factories = [
-        AttributeFactory('epoch', conversion=None, set_none=True),
-        AttributeFactory('version', conversion=None, set_none=True),
-        AttributeFactory('release', conversion=None, set_none=True),
-    ]
+    return '{}{}{}'.format(
+            '{}:'.format(epoch) if epoch else '',
+            version,
+            '-{}'.format(release) if release else ''
+        )
 
-    @staticmethod
-    def format_evr(version, epoch=None, release=None):
-        """The EVR value has a specific way of representation in solv.
 
-        :param version: the version value
-        :type version: basestring
-        :param epoch: the epoch value; optional
-        :type epoch: basestring or None
-        :param release: the release value; optional
-        :type release: basestring or None
-        :returns: the epoch:version-release string
-        """
-        return '{}{}{}'.format(
-                '{}:'.format(epoch) if epoch else '',
-                version,
-                '-{}'.format(release) if release else ''
-            )
+def compound_attribute_factory(adaptor_factory, *compound_factories):
+    def outer(fn):
+        @functools.wraps(fn)
+        def inner(solvable, unit, repo=None):
+            adaptor = adaptor_factory()
+            for attr_factory in compound_factories:
+                attr_factory(adaptor, unit, repo=repo)
+            fn(solvable, adaptor, repo=repo)
+        return inner
+    return outer
+
+
+def evr_attribute_factory(attr_name='evr'):
+    """A specific, epoch, version and release compound attribute."""
 
     class Adaptor(object):
         @property
         def evr(self):
-            return EVRAttributeFactory.format_evr(
-                self.version, self.epoch, self.release)
+            return format_evr(self.version, self.epoch, self.release)
 
-    def __call__(self, solvable, unit, *args):
-        """Set the solvable evr attribute.
-
-        :param solvable: the sovlable to set the attribute of
-        :type sovlable: an object
-        :param unit: the unit to use to get the composing attribute values from
-        :type unit: an object or a dictionary
-        :returns: None
-        """
-        # create a fresh adaptor instance
-        adaptor = self.Adaptor()
-
-        # pull the compound values out from the unit object, pretending
-        # the adaptor is a solvable
-        for attribute_factory in self.attribute_factories:
-            attribute_factory(adaptor, unit, *args)
-
-        # set the solvable.evr with the value of the adaptor
-        # NOTE: by default the adaptor is str()ed before assigning
-        self.attribute_factory(solvable, adaptor, *args)
+    return compound_attribute_factory(
+        Adaptor,
+        attribute_factory('epoch', set_none=True, conversion=None),
+        attribute_factory('version', set_none=True, conversion=None),
+        attribute_factory('release', set_none=True, conversion=None),
+    )(attribute_factory('evr'))
 
 
-class RpmDependencyAttributeFactory(object):
-    attribute_factories = [
-        AttributeFactory('name', set_none=True),
-        EVRAttributeFactory(),
-        AttributeFactory('flags', set_none=True, conversion=None),
-    ]
+def multi_attribute_factory(attr_name):
+    def outer(fn):
+        @functools.wraps(fn)
+        def inner(solvable, unit, repo=None):
+            for item in getattr(unit, attr_name, []):
+                fn(solvable, item, repo=repo)
+        return inner
+    return outer
 
+
+def rpm_dependency_attribute_factory(attr_name, dependency_key=None):
+    """An RPM-specific dependency factory.
+
+    for the provides, requires, etc... dependency attributes
+    nested, generic factory that creates the solv.Rel/solv.Dep
+    objects and registers those to a solvable
+
+    :param attr_name: the attribute name to use
+    :type attr_name: basestring
+    :param dependency_key: the key to use e.g solv.SOLVABLE_REQUIRES
+    :type dependency_key: solv.SOLVABLE_REQUIRES/_PROVIDES... or None
+    """
     class Adaptor(object):
         pass
 
-    def __init__(self, attr_name, dependency_key=None):
-        """An RPM-specific dependency factory.
-
-        for the provides, requires, etc... dependency attributes
-        nested, generic factory that creates the solv.Rel/solv.Dep
-        objects and registers those to a solvable
-
-        :param attr_name: the attribute name to use
-        :type attr_name: basestring
-        :param dependency_key: the key to use e.g solv.SOLVABLE_REQUIRES
-        :type dependency_key: solv.SOLVABLE_REQUIRES/_PROVIDES... or None
-        """
-        self.attr_name = attr_name
-        self.dependency_key = dependency_key
-
-    def __call__(self, solvable, unit, solv_factory):
+    @multi_attribute_factory(attr_name)
+    @compound_attribute_factory(
+        Adaptor,
+        attribute_factory('name'),
+        evr_attribute_factory(),
+        attribute_factory('flags', set_none=True, conversion=None)
+    )
+    def inner_factory(solvable, unit, repo=None):
         """Set the solvable dependencies.
 
         The dependencies of a unit are stored as a list of dictionaries,
@@ -210,169 +198,184 @@ class RpmDependencyAttributeFactory(object):
         :type solvable: a libsolv solvable
         :param unit: the content unit to get the dependencies from
         :type unit: an object or a dictionary
-        :param solv_factory: the solvable factory
-        :type solv_factory: BasetUnitSolvableFactory
+        :param repo: the solv repo being populated
+        :type repo: solv.Repo
         :returns: None
         """
         # e.g SOLVABLE_PROVIDES, SOLVABLE_REQUIRES...
-        keyname = self.dependency_key or getattr(
-            solv, 'SOLVABLE_{}'.format(self.attr_name.upper()))
-        # process all the records in e.g unit.requires which is a list of
-        # dictionaries describing the unit dependencies
-        dependency_unit_infos = getattr(unit, self.attr_name, [])
-        print('processing unit {} attribute {} value {}'.format(
-            unit, self.attr_name, dependency_unit_infos))
-        pool = solv_factory.solv_repo.pool
-        for depinfo in dependency_unit_infos:
-            adaptor = self.Adaptor()
-            for attribute_factory in self.attribute_factories:
-                attribute_factory(adaptor, depinfo, solv_factory)
-            if adaptor.name.startswith('('):
-                # the Rich/Boolean dependencies have just the 'name' attribute
-                # this is always in the form: '(foo >= 1.2 AND bar != 0.9)'
-                dep = pool.parserpmrichdep(adaptor.name)
-            else:
-                # generic dependencies provide at least a solvable name
-                dep = pool.Dep(adaptor.name)
-                if adaptor.flags:
-                    # in case the flags unit attribute is populated, use it as
-                    # a solv.Rel object to denote solvable--dependency
-                    # relationship dependency in this case is a relationship
-                    # towards the dependency made from the 'flags', e.g:
-                    # solv.REL_AND, and the evr fields
-                    dep = dep.Rel(
-                        getattr(solv, 'REL_{}'.format(adaptor.flags)),
-                        pool.Dep(adaptor.evr)
-                    )
+        keyname = dependency_key or getattr(solv, 'SOLVABLE_{}'.format(attr_name.upper()))
+        pool = repo.pool
+        if unit.name.startswith('('):
+            # the Rich/Boolean dependencies have just the 'name' attribute
+            # this is always in the form: '(foo >= 1.2 AND bar != 0.9)'
+            dep = pool.parserpmrichdep(unit.name)
+        else:
+            # generic dependencies provide at least a solvable name
+            dep = pool.Dep(unit.name)
+            if unit.flags:
+                # in case the flags unit attribute is populated, use it as
+                # a solv.Rel object to denote solvable--dependency
+                # relationship dependency in this case is a relationship
+                # towards the dependency made from the 'flags', e.g:
+                # solv.REL_AND, and the evr fields
+                dep = dep.Rel(
+                    getattr(solv, 'REL_{}'.format(unit.flags)),
+                    pool.Dep(unit.evr)
+                )
             # register the constructed solvable dependency
             solvable.add_deparray(keyname, dep)
+    return inner_factory
 
 
-class BasetUnitSolvableFactory(object):
-    attribute_factories = []
+def unit_solvable_converter_factory(*attribute_factories):
+    """Create a factory of a content unit--solv.Solvable converter.
 
-    def __init__(self, solv_repo):
-        # a solv.id <-> content_unit.id mapping
-        # might use DBM to relieve memory pressure
-        self.id_mapping = {}
-        self.solv_repo = solv_repo
+    Each attribute factory either calls setattr on a solvable with a converted attribute value
+    or processes the attribute value and changes the state of either the solvable being created
+    or the solv.Repo or both by e.g adding dependencies.
 
-    def __call__(self, unit):
-        solvable = self.solv_repo.add_solvable()
-        for attribute_factory in self.attribute_factories:
-            attribute_factory(solvable, unit, self)
-        self.register(solvable, unit)
+    :param attribute_factories: the attribute factories to use for the conversion
+    :type attribute_factories: a list of (solvable, unit, repo=None) -> None callables
+    :returns: a (solv_repo, unit) -> solv.Solvable callable
+    :rtype: callable
+    """
+    def unit_solvable_converter(solv_repo, unit):
+        """Convert a unit into a solv.Solvable.
+
+        As an inevitable side effect, the solvable is added into the repo specified.
+
+        :param solv_repo: the repository the unit is being added into
+        :type solv_repo: solv.Repo
+        :param unit: the unit being converted
+        :type unit: pulp_rpm.plugins.models.Model
+        :return: the solvable created.
+        :rtype: solv.Solvable
+        """
+        solvable = solv_repo.add_solvable()
+        for attribute_factory in attribute_factories:
+            attribute_factory(solvable, unit, solv_repo)
         return solvable
-
-    def register(self, solvable, unit):
-        if isinstance(unit, dict):
-            # avoid mapping dependency dicts
-            return
-        self.id_mapping[unit.id] = solvable.id
-        # FIXME the unit is cached this might exhaust memory
-        # good only for demo purposes
-        self.id_mapping[solvable.id] = unit
-
-    def get_unit(self, solvable_id):
-        return self.id_mapping.get(solvable_id)
-
-    def get_solvable(self, unit_id):
-        return self.id_mapping.get(unit_id)
+    return unit_solvable_converter
 
 
-class RpmUnitSolvableFactory(BasetUnitSolvableFactory):
+rpm_unit_solvable_factory = unit_solvable_converter_factory(
     # An RPM content unit nests dependencies in a dict format
     # Would be provided by pulp_rpm
-    attribute_factories = [
-        AttributeFactory('name'),
-        EVRAttributeFactory(),
-        AttributeFactory('arch'),
-        AttributeFactory('vendor'),
-        RpmDependencyAttributeFactory('requires'),
-        RpmDependencyAttributeFactory('conflicts'),
-        RpmDependencyAttributeFactory('provides'),
-        RpmDependencyAttributeFactory('obsoletes'),
-        RpmDependencyAttributeFactory('recommends'),
-        RpmDependencyAttributeFactory('suggests'),
-        RpmDependencyAttributeFactory('supplements'),
-        RpmDependencyAttributeFactory('enhances'),
-    ]
+    attribute_factory('name'),
+    evr_attribute_factory(),
+    attribute_factory('arch'),
+    attribute_factory('vendor'),
+    rpm_dependency_attribute_factory('requires'),
+    rpm_dependency_attribute_factory('conflicts'),
+    rpm_dependency_attribute_factory('provides'),
+    rpm_dependency_attribute_factory('obsoletes'),
+    rpm_dependency_attribute_factory('recommends'),
+    rpm_dependency_attribute_factory('suggests'),
+    rpm_dependency_attribute_factory('supplements'),
+    rpm_dependency_attribute_factory('enhances'),
+)
 
 
-class ErratumSolvableFactory(BasetUnitSolvableFactory):
-    attribute_factories = [
-        # cargo-culting from
-        # https://github.com/openSUSE/libsolv/blob/master/ext/repo_updateinfoxml.c
-        AttributeFactory('errata_id', target_attr='name',
-                         conversion=lambda x: 'errata:{}'.format(x)),
-        AttributeFactory('arch', default='noarch'),
-        AttributeFactory('errata_from', target_attr='vendor'),
-        EVRAttributeFactory(),
-        # FIXME: not all these units are really required; what pulp does is it
-        # filters rpm_search_dicts to nevras actually present in the source repo:
-        #   https://github.com/pulp/pulp_rpm/blob/ef5fc5b2af47736114b68bc08658d9b2a94b84e1/plugins/pulp_rpm/plugins/importers/yum/associate.py#L91,#L94
-        # Could this be handled as some ignore_missing?
-        RpmDependencyAttributeFactory(
-            'rpm_search_dicts', dependency_key=solv.SOLVABLE_REQUIRES),
-    ]
+def nonproviding_sovlable_factory(rel_attr_name='evr'):
+    """A decorator wrapping a non-providing unit factory with a 'provides' logic.
 
-    def __call__(self, unit):
-        # RPMs "self-provide"; errata don't --- have to be explicit; see also:
-        # https://github.com/openSUSE/libsolv/blob/master/ext/repo_updateinfoxml.c#L343
-        solvable = super(ErratumSolvableFactory, self).__call__(unit)
-        pool = self.solv_repo.pool
-        dep = pool.Dep(solvable.name)
-        dep = dep.Rel(solv.REL_EQ, pool.Dep(solvable.evr))
-        solvable.add_deparray(solv.SOLVABLE_PROVIDES, dep)
-        return solvable
+    E.g an erratum doesn't provide itself as a "dependency".
+    The wrapper creates a new solv.SOLVABLE_PROVIDES dependency in the repo/pool
+    with the solvable as a target value.
+
+    If the optional rel_attr_name param is provided, a sovl.REL_EQ relationship is created,
+    from the attribute value as an EVR equivalent, that refines the dependency.
+
+    :param rel_attr_name: the attribute to use as an evr equivalent when providing
+    :type rel_attr_name: basestring
+    :returns: a wrapper that ensures a solvable provides itself in the pool
+    :rtype: a (solv.Repo, unit) -> solv.Solvable callable
+    """
+    def outer(fn):
+        @functools.wraps(fn)
+        def inner(solv_repo, unit):
+            solvable = fn(solv_repo, unit)
+            dep = solv_repo.pool.Dep(solvable.name)
+            rel = None
+            if rel_attr_name:
+                rel = getattr(solvable, rel_attr_name, None)
+            if rel:
+                dep = dep.Rel(solv.REL_EQ, solv_repo.pool.Dep(rel))
+            solvable.add_deparray(solv.SOLVABLE_PROVIDES, dep)
+            return solvable
+        return inner
+    return outer
 
 
-class SrpmSolvableFactory(BasetUnitSolvableFactory):
+erratum_solvable_factory = nonproviding_sovlable_factory('evr')(unit_solvable_converter_factory(
+    # cargo-culting from
+    # https://github.com/openSUSE/libsolv/blob/master/ext/repo_updateinfoxml.c
+    attribute_factory('errata_id', target_attr='name',
+                      conversion=lambda x: 'errata:{}'.format(x)),
+    attribute_factory('arch', default='noarch'),
+    attribute_factory('errata_from', target_attr='vendor'),
+    evr_attribute_factory(),
+    # FIXME: not all these units are really required; what pulp does is it
+    # filters rpm_search_dicts to nevras actually present in the source repo:
+    #   https://github.com/pulp/pulp_rpm/blob/ef5fc5b2af47736114b68bc08658d9b2a94b84e1/plugins/pulp_rpm/plugins/importers/yum/associate.py#L91,#L94
+    # Could this be handled as some ignore_missing?
+    rpm_dependency_attribute_factory(
+        'rpm_search_dicts', dependency_key=solv.SOLVABLE_REQUIRES),
+))
+
+
+srpm_sovable_factory = unit_solvable_converter_factory(
     # An SRPM content unit factory
-    attribute_factories = [
-        AttributeFactory('name'),
-        EVRAttributeFactory(),
-        AttributeFactory('arch'),
-        AttributeFactory('vendor'),
-        RpmDependencyAttributeFactory('requires'),
-        RpmDependencyAttributeFactory('conflicts'),
-    ]
-
-    def __call__(self, unit):
-        solvable = super(SrpmSolvableFactory, self).__call__(unit)
-        pool = self.solv_repo.pool
-        dep = pool.Dep(solvable.name)
-        dep = dep.Rel(solv.REL_EQ, pool.Dep(solvable.evr))
-        solvable.add_deparray(solv.SOLVABLE_PROVIDES, dep)
-        return solvable
-
+    attribute_factory('name'),
+    evr_attribute_factory(),
+    attribute_factory('arch'),
+    attribute_factory('vendor'),
+    rpm_dependency_attribute_factory('requires'),
+    rpm_dependency_attribute_factory('conflicts'),
+)
 
 MODEL_SOLVABLE_FACTORY_MAPPING = {
-    'rpm': RpmUnitSolvableFactory,
-    'erratum': ErratumSolvableFactory,
-    'srpm': SrpmSolvableFactory,
+    'rpm': rpm_unit_solvable_factory,
+    'erratum': erratum_solvable_factory,
+    'srpm': srpm_sovable_factory,
 }
 
 
-def load_repo_units(plugin_manager, repo_name, factory_mapping):
+def load_repo_units(plugin_manager, repo, repo_name, mapping):
     for rcu in RepositoryContentUnit.objects.find_by_criteria(
             Criteria(filters={'repo_id': repo_name})):
         try:
-            factory = factory_mapping[rcu.unit_type_id]
+            factory = MODEL_SOLVABLE_FACTORY_MAPPING[rcu.unit_type_id]
         except KeyError:
             print('skipping {}'.format(rcu.unit_type_id))
             continue
         model = plugin_manager.unit_models[rcu.unit_type_id]
         unit = model.objects.get(pk=rcu.unit_id)
+        solvable = factory(repo, unit)
+
+        mapping.setdefault(solvable.id, unit)
+        mapping.setdefault(unit.id, solvable)
+
         print('loaded {}'.format(unit))
-        factory(unit)
 
 
-def repo_unit_type_factory_mapping(repo):
-    return {
-        unit_type: unit_type_factory(repo)
-        for unit_type, unit_type_factory in MODEL_SOLVABLE_FACTORY_MAPPING.items()
-    }
+PoolMapping = collections.namedtuple('PoolMapping', 'pool mapping')
+
+
+def pool_mapping_factory(plugin_manager, source_repo_name, target_repo_name=None):
+    poolmapping = PoolMapping(solv.Pool(), {})
+    # prevent https://github.com/openSUSE/libsolv/issues/267
+    poolmapping.pool.setarch()
+    source_repo = poolmapping.pool.add_repo(source_repo_name)
+    load_repo_units(plugin_manager, source_repo, source_repo_name, poolmapping.mapping)
+
+    if not target_repo_name:
+        return poolmapping
+
+    target_repo = poolmapping.pool.add_repo(target_repo_name)
+    load_repo_units(plugin_manager, target_repo, target_repo_name, poolmapping.mapping)
+    poolmapping.pool.installed = target_repo
+    return poolmapping
 
 
 if __name__ == '__main__':
@@ -389,24 +392,12 @@ if __name__ == '__main__':
     pm = manager.PluginManager()
     db_initialize()
 
-    pool = solv.Pool()
-    pool.set_debuglevel(args.debuglevel)
-    pool.setarch()
-    # pretend nothing has been installed so far
-    target_repo = pool.add_repo('@System')
-
-    target_unit_solvable_factory_mapping = repo_unit_type_factory_mapping(target_repo)
-    load_repo_units(pm, args.target_repo, target_unit_solvable_factory_mapping)
-    pool.installed = target_repo
-
-    # load the Pulp repo provided on the CLI
-    source_repo = pool.add_repo(args.source_repo)
-    source_unit_solvable_factory_mapping = repo_unit_type_factory_mapping(source_repo)
-    load_repo_units(pm, args.source_repo, source_unit_solvable_factory_mapping)
+    poolmapping = pool_mapping_factory(pm, args.source_repo, args.target_repo)
+    poolmapping.pool.set_debuglevel(args.debuglevel)
 
     print('---')
     print('Loaded solvables:')
-    for solvable in pool.solvables:
+    for solvable in poolmapping.pool.solvables:
         print("{}".format(solvable))
 
     print('---')
@@ -414,7 +405,7 @@ if __name__ == '__main__':
     # ###
     # Cargo-culting https://github.com/openSUSE/libsolv/blob/master/examples/pysolv
     #
-    pool.createwhatprovides()
+    poolmapping.pool.createwhatprovides()
 
     # lookup is provided by libsolv; mind the SOLVER_SOLVABLE_NAME flag
     # to list the dependencies an installation is pretended
@@ -430,7 +421,7 @@ if __name__ == '__main__':
         solv.Selection.SELECTION_WITH_SOURCE
     )
 
-    selection = pool.select(args.unit, flags)
+    selection = poolmapping.pool.select(args.unit, flags)
     if selection.isempty():
         print("{} not found".format(args.unit))
         sys.exit(1)
@@ -439,7 +430,7 @@ if __name__ == '__main__':
 
     print('job: {}'.format(jobs))
 
-    solver = pool.Solver()
+    solver = poolmapping.pool.Solver()
     solver.set_flag(solv.Solver.SOLVER_FLAG_IGNORE_RECOMMENDED, args.ignore_recommends)
 
     problems = solver.solve(jobs)
@@ -457,11 +448,7 @@ if __name__ == '__main__':
     print('Copying unit "{}" from repo "{}" to repo "{}" requires:'.format(
         args.unit, args.source_repo, args.target_repo))
     for s in transaction.newsolvables():
-        print('solvable - {} as unit: {}'.format(
-            s, (source_unit_solvable_factory_mapping['rpm'].get_unit(s.id) or
-                source_unit_solvable_factory_mapping['erratum'].get_unit(s.id) or
-                source_unit_solvable_factory_mapping['srpm'].get_unit(s.id))))
-
+        print('solvable - {} as unit: {}'.format(s, poolmapping.mapping.get(s.id)))
 
     print('\nTransaction details:')
     for cl in transaction.classify(
