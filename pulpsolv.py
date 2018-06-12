@@ -422,20 +422,22 @@ if __name__ == '__main__':
     # as libsolv system repo to prevent copying dependencies already satisfied
     # in the target repo.
 
-    flags = (
-        solv.Selection.SELECTION_NAME |
-        solv.Selection.SELECTION_PROVIDES |
-        solv.Selection.SELECTION_GLOB |
-        solv.Selection.SELECTION_DOTARCH |
-        solv.Selection.SELECTION_WITH_SOURCE
-    )
+    #flags = (
+    #    solv.Selection.SELECTION_NAME |
+    #    solv.Selection.SELECTION_PROVIDES |
+    #    solv.Selection.SELECTION_GLOB |
+    #    solv.Selection.SELECTION_DOTARCH |
+    #    solv.Selection.SELECTION_WITH_SOURCE
+    #)
 
-    selection = pool.select(args.unit, flags)
-    if selection.isempty():
-        print("{} not found".format(args.unit))
-        sys.exit(1)
+    #selection = pool.select(args.unit, flags)
+    #if selection.isempty():
+    #    print("{} not found".format(args.unit))
+    #    sys.exit(1)
 
-    jobs = selection.jobs(solv.Job.SOLVER_INSTALL)
+    id = pool.str2id(args.unit, create=True)
+    id = pool.rel2id(id, solv.ARCH_SRC, solv.REL_ARCH, create=True)
+    jobs = [pool.Job(solv.Job.SOLVER_SOLVABLE_NAME | solv.Job.SOLVER_INSTALL, id)]
 
     print('job: {}'.format(jobs))
 
