@@ -417,11 +417,58 @@ class Solver(object):
         return set(self.mapping.get_unit(solvable) for solvable in transaction.newsolvables())
 
 
+    def optimist(self, solvables, level=0, cache=set()):
+        for solvable in solvables:
+            if solvable in cache:
+                continue
+            cache.add(solvable)
+            print ("  " * level) + "s: {}".format(solvable)
+            yield solvable
+            for dep in solvable.lookup_deparray(solv.SOLVABLE_REQUIRES):
+                if dep in cache:
+                    continue
+                cache.add(dep)
+                whatprovides = self.pool.whatprovides(dep)
+                print ("  " * (level + 1)) + "w {}: {}".format(dep, whatprovides)
+                for solvable_ in self.optimist(whatprovides, level=level + 1):
+                    yield solvable_
+
+    def brainchild(self, name):
+        pool = self.pool
+        done = set()
+        sel = pool.select(name, solv.Selection.SELECTION_NAME)
+        solvables = sel.solvables()
+        if not solvables:
+            return done
+        pkg = sel.solvables()[-1]
+        candq = {pkg}
+        while candq:
+            candq_n = set()
+            for cand in candq:
+                for req in cand.lookup_deparray(solv.SOLVABLE_REQUIRES):
+                    providers = pool.whatprovides(req)
+                    if not providers:
+                        print("Nothing provides {req!r}".format(req=req))
+                        continue
+                    for p in pool.whatprovides(req):
+                        candq_n.add(p)
+                done.add(cand)
+            candq = candq_n - done
+        return done
+
+    def walk_unit_dependencies(self, units):
+        for unit in units:
+            dependencies = list(self.optimist(self.pool.whatprovides(self.pool.Dep(unit))))
+            print "Dependencies of {} are".format(unit)
+            for dependency in dependencies:
+                print "  {}".format(dependency)
+
+
 if __name__ == '__main__':
 
     argparser = argparse.ArgumentParser()
     argparser.add_argument('--source-repo', default='zoo')
-    argparser.add_argument('--unit', dest='units', action='append')
+    argparser.add_argument('--unit', dest='units', action='append', default=[])
     argparser.add_argument('--target-repo', nargs='?', default=None)
     argparser.add_argument('--ignore-recommends', action='store_true')
     argparser.add_argument('--debuglevel', choices=[0, 1, 2, 3], type=int,
@@ -442,8 +489,10 @@ if __name__ == '__main__':
     print('Query:')
     for unit in args.units:
         print('{}'.format(unit))
+        print('  {}'.format(', '.join(str(dep) for dep in solver.brainchild(unit))))
 
     print
-    print('Dependent units:')
-    for unit in solver.find_dependent_rpms(args.units):
-        print('{}'.format(unit))
+    #print('Dependent units:')
+    #for unit in solver.find_dependent_rpms(args.units):
+    #    print('{}'.format(unit))
+    solver.walk_unit_dependencies(args.units)
